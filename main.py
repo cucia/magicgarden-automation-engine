@@ -1,17 +1,32 @@
-import os
-import time
 import json
+import os
 import random
+import sys
+import time
+
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
 from modules.harvest import HarvestModule
 from modules.sell import SellModule
 
+# Force line-buffered output
+sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
+sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
+
 # ============================================================
 # ENV
 # ============================================================
+print("[INIT] Loading environment variables...", flush=True)
 load_dotenv()
+print("[INIT] Environment loaded", flush=True)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+GAME_URL = "https://magicgarden.gg"
+DEFAULT_VIEWPORT = {"width": 1280, "height": 720}
+WS_FRAME_THROTTLE = 5  # Process every 5th frame (reduce CPU)
 
 ENGINE_TICK = float(os.getenv("ENGINE_TICK", 0.2))
 IDLE_THRESHOLD = float(os.getenv("IDLE_THRESHOLD", 15))
@@ -57,6 +72,10 @@ state = {
     "harvest_cursor": 0,
 }
 
+
+def any_modules_enabled():
+    return ENABLE_HARVEST or ENABLE_SELL or ENABLE_BUY or ENABLE_PLANT
+
 def mark_activity():
     state["last_activity"] = time.time()
 
@@ -67,15 +86,27 @@ def idle_time():
 # WEBSOCKET HANDLING
 # ============================================================
 def attach_websocket_listeners(page):
+    # Skip WS listeners if no modules are enabled
+    if not any_modules_enabled():
+        print("[WS] No modules enabled - skipping WebSocket listeners (CPU optimization)")
+        return
+    
+    frame_counter = [0]  # counter for throttling
+    
     def on_ws(ws):
         ws.on("framereceived", on_frame)
         ws.on("close", on_close)
 
     def on_close():
         state["connection_lost_at"] = time.time()
-        print("[WS] Connection closed")
+        print(f"[WS] Connection LOST at {time.strftime('%H:%M:%S')}")
 
     def on_frame(frame):
+        # Throttle frame processing to reduce CPU
+        frame_counter[0] += 1
+        if frame_counter[0] % WS_FRAME_THROTTLE != 0:
+            return
+        
         try:
             data = json.loads(frame.payload)
         except Exception:
@@ -155,6 +186,7 @@ def main():
             print("[INFO] Non-persistent session")
 
         # -------------------- STEALTH PATCH --------------------
+        print("[DEBUG] Adding stealth patch")
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             window.chrome = { runtime: {} };
@@ -163,8 +195,17 @@ def main():
         """)
 
         # -------------------- OPEN GAME --------------------
-        page.goto("https://magicgarden.gg")
+        print("[DEBUG] Navigating to magicgarden.gg...")
+        try:
+            page.goto(GAME_URL, timeout=30000)
+            print("✓ [INFO] Game page loaded successfully")
+        except Exception as e:
+            print(f"✗ [ERROR] Failed to load game: {e}")
+            raise
+        
+        print("[DEBUG] Attaching WebSocket listeners...")
         attach_websocket_listeners(page)
+        print("✓ [INFO] WebSocket listeners attached")
 
         print("[INFO] Game opened. Login once if needed.")
 
@@ -175,40 +216,79 @@ def main():
         # ========================================================
         # MAIN LOOP
         # ========================================================
+        loop_count = 0
+        print(f"✓ [INFO] Starting main loop (ENGINE_TICK={ENGINE_TICK}, HARVEST={ENABLE_HARVEST}, SELL={ENABLE_SELL})")
+        
         while True:
+            loop_count += 1
             acted = False
 
             # ---------- AUTO RECONNECT ----------
             if AUTO_RECONNECT and state["connection_lost_at"]:
                 elapsed = time.time() - state["connection_lost_at"]
                 if elapsed >= RECONNECT_WAIT:
-                    print("[RECONNECT] Reloading game")
+                    print(f"⚠ [RECONNECT] Connection lost for {elapsed:.1f}s. Reloading game...")
                     state["connection_lost_at"] = None
                     page.reload()
                     mark_activity()
                     time.sleep(5)
+                    print("✓ [RECONNECT] Game reloaded")
                     continue
-
+                elif loop_count % 20 == 0:
+                    print(f"[RECONNECT] Waiting for reconnect... {elapsed:.1f}s / {RECONNECT_WAIT}s")
+            
+            # Log connection status
+            if loop_count % 100 == 0:
+                conn_status = "✓ CONNECTED" if not state["connection_lost_at"] else "✗ DISCONNECTED"
+                print(f"[STATUS] Loop #{loop_count} | {conn_status} | Plots: {len(state['plots'])} | Inventory Full: {state['inventory_full']}")
+            
             # ---------- SELL FIRST (BLOCKING) ----------
-            if ENABLE_SELL and sell_module.run():
-                mark_activity()
-                acted = True
-                continue  # resume harvest from same cursor
+            if ENABLE_SELL:
+                try:
+                    if sell_module.run():
+                        print(f"✓ [SELL] Selling items...")
+                        mark_activity()
+                        acted = True
+                        continue
+                except Exception as e:
+                    print(f"✗ [ERROR] Sell module crashed: {e}")
 
             # ---------- HARVEST ----------
-            if ENABLE_HARVEST and harvest_module.run():
-                mark_activity()
-                acted = True
+            if ENABLE_HARVEST:
+                try:
+                    if harvest_module.run():
+                        if loop_count % 10 == 0:
+                            print(f"✓ [HARVEST] Harvesting plots... (Loop #{loop_count})")
+                        mark_activity()
+                        acted = True
+                except Exception as e:
+                    print(f"✗ [ERROR] Harvest module crashed: {e}")
 
             # ---------- IDLE KEEP ALIVE ----------
             if not acted and idle_time() > IDLE_THRESHOLD:
-                page.keyboard.press("ArrowLeft")
-                page.wait_for_timeout(150)
-                page.keyboard.press("ArrowRight")
-                mark_activity()
+                print(f"[IDLE] No action for {idle_time():.1f}s. Sending keep-alive ping...")
+                try:
+                    page.keyboard.press("ArrowLeft")
+                    page.wait_for_timeout(150)
+                    page.keyboard.press("ArrowRight")
+                    mark_activity()
+                except Exception as e:
+                    print(f"✗ [ERROR] Keep-alive failed: {e}")
+            
+            if loop_count % 200 == 0:
+                print(f"[LOOP] Running... (Loop #{loop_count} | Idle for {idle_time():.1f}s)")
 
             time.sleep(ENGINE_TICK + random.uniform(0, 0.05))
 
 # ============================================================
 if __name__ == "__main__":
-    main()
+    try:
+        print("[MAIN] Starting automation engine...", flush=True)
+        main()
+    except KeyboardInterrupt:
+        print("\n[MAIN] Shutting down gracefully...", flush=True)
+    except Exception as e:
+        print(f"✗ [FATAL] Unhandled error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

@@ -1,8 +1,10 @@
 services:
   magicgarden:
     build: .
+    cpus: "1.5"
+    mem_limit: "1g"
     ports:
-      - "6080:6080"
+      - "5900:5900"
     env_file:
       - .env
     volumes:
