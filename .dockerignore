@@ -1,0 +1,16 @@
+# Ignore Playwright persistent profile
+browser-profile/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Git
+.git
+.gitignore
+
+# Env files
+.env
+
+# Node / misc
+node_modules/

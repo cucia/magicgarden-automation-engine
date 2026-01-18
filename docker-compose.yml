@@ -1,0 +1,12 @@
+services:
+  magicgarden:
+    build: .
+    ports:
+      - "6080:6080"
+    env_file:
+      - .env
+    volumes:
+      - magicgarden_browser_profile:/app/browser-profile
+
+volumes:
+  magicgarden_browser_profile:
